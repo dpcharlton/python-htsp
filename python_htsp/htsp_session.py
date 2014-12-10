@@ -22,6 +22,7 @@
 import datetime
 import hashlib
 import socket
+import time
 
 from tvh import htsmsg
 
@@ -30,13 +31,14 @@ HTSP_PROTO_VERSION = 17
 class ProtocolVersionException(Exception):
 	"""Raised when an operation is requested that is not supported by the protocol version"""
 
+class RequestError(Exception):
+	"""Raised when an HTSP request fails"""	
+
 class HTSPResponse(object):
 	"""Base class for HTSPResponse classes"""
 	def __init__(self,session,message):
 		self._session=session
-		self._message=message
-
-
+		self._message=message if message else {}
 
 	# seq              int  optional   Sequence number. Same as in the request.
 	@property
@@ -63,6 +65,11 @@ class HTSPResponse(object):
 	def _datetime_from_timestamp(self,timestamp):
 		# TODO: Adjust for server timezone?
 		return datetime.datetime.fromtimestamp(timestamp)
+
+	def _timestamp_from_datetime(self,datetime):
+		# TODO: Adjust for server timezone?
+		return int(time.mktime(datetime.timetuple()))
+
 
 class HTSPHello(HTSPResponse):
 	"""Represents an HTSP 'hello' reply message"""
@@ -228,7 +235,7 @@ class HTSPChannel(HTSPResponse):
 
 	@property
 	def events(self):
-		return self._session.get_events(self.id)
+		return self._session._get_events(self.id)
 
 
 class HTSPTag(HTSPResponse):
@@ -271,7 +278,11 @@ class HTSPDVREntry(HTSPResponse):
 	@property
 	def channel(self):
 		"""Channel of dvr entry"""
-		return self._session.get_channel(self._message['channel'])
+		return self._session._get_channel(self._message['channel'])
+
+	@channel.setter
+	def channel(self,value):
+		self._message['channel']=value.id
 
 	# start              s64   required   Time of when this entry was scheduled to start recording.
 	@property
@@ -279,11 +290,20 @@ class HTSPDVREntry(HTSPResponse):
 		"""Start time of this entry"""
 		return self._datetime_from_timestamp(self._message['start'])
 
+	@start.setter
+	def start(self,value):
+		self._message['start']= self._timestamp_from_datetime(value)
+
 	# stop               s64   required   Time of when this entry was scheduled to stop recording.
 	@property
 	def stop(self):
 		"""End time of this entry"""
 		return self._datetime_from_timestamp(self._message['stop'])
+
+	@stop.setter
+	def stop(self,value):
+		self._message['stop']=self._timestamp_from_datetime(value)
+
 
 	@property
 	def duration(self):
@@ -294,8 +314,29 @@ class HTSPDVREntry(HTSPResponse):
 	# startExtra         s64   required   Extra start time (pre-time) in minutes (Added in version 13).
 	# stopExtra          s64   required   Extra stop time (post-time) in minutes (Added in version 13).
 	# retention          s64   required   DVR Entry retention time in days.
+
+	@property
+	def retention(self):
+		"""Retention of this entry"""
+		return self._message['retention']
+
+
 	# priority           u32   required   Priority (0 = Important, 1 = High, 2 = Normal, 3 = Low, 4 = Unimportant, 5 = Not set) (Added in version 13).
+	
 	# eventId            u32   optional   Associated EPG Event ID (Added in version 13).
+	@property
+	def event(self):
+		"""Associated EPG Event"""
+		self._checkProtocol(13)
+		event_id=self._message.get('eventId',None)
+		if event_id:
+			return self._session._get_event(event_id)
+
+	@event.setter
+	def event(self,value):
+		self._message['eventId']=value.id
+
+
 	# autorecId          u32   optional   Associated Autorec ID (Added in version 13).
 	# contentType        u32   optional   Content Type (like in the DVB standard) (Added in version 13).
 	
@@ -304,6 +345,11 @@ class HTSPDVREntry(HTSPResponse):
 	def title(self):
 		"""Title of entry"""
 		return self._message.get('title',None)
+
+	@title.setter
+	def title(self,value):
+		self._message['title']=value
+
 
 	# summary            str   optional   Short description of the recording (Added in version 6).
 	@property
@@ -326,6 +372,52 @@ class HTSPDVREntry(HTSPResponse):
 
 	# error              str   optional   Plain english error description (e.g. "Aborted by user").
 
+	def _as_add_dvr_entry_command(self):
+		"""Map this HTSPDVREntry into a HTSP addDvrEntry request message """
+
+		# -------------------------------------------------------------------
+		# Note: There are inconsistencies between the HTSP dvrEntryAdd 
+		# response message and the HTSP addDvrEntry request message.
+		# Rather than have two separate classes for the response and request
+		# we take the dvrEntryAdd reponse to bet he canonical version and
+		# provide this method to convert to a request message
+		# -------------------------------------------------------------------
+
+		# eventId            u32   optional   Event ID (Optional since version 5).
+		# channelId          u32   optional   Channel ID (Added in version 5)
+		# start              s64   optional   Time to start recording (Added in version 5)
+		# stop               s64   optional   Time to stop recording (Added in version 5)
+		# retention          u32   optional   Retention time in days (Added in version 13)
+		# creator            str   optional   Name of the event creator (Added in version 5)
+		# priority           u32   optional   Recording priority (Added in version 5)
+		# startExtra         s64   optional   Pre-recording buffer in minutes (Added in version 5)
+		# stopExtra          s64   optional   Post-recording buffer in minutes (Added in version 5)
+		# title              str   optional   Recording title, if no eventId (Added in version 6)
+		# description        str   optional   Recording description, if no eventId (Added in version 5)
+		# configName         str   optional   DVR configuration name or UUID		
+
+		command={
+			'retention' 	: self._message.get('retention',0),
+			#'creator' 		: self._message.get('creator'),
+			#'priority' 		: self._message.get('priority'),
+			#'startExtra' 	: self._message.get('startExtra'),
+			#'stopExtra' 	: self._message.get('stopExtra'),
+			'title' 		: self._message.get('title'),
+			#'description' 	: self._message.get('description'),
+			#'configName' 	: self._message.get('configName'),
+		}
+
+		if 'eventId' in self._message:
+			event=self._session._get_event(self._message.get('eventId'))
+			command['eventId']=event.id
+			if not 'title' in command or not command['title']:
+				command['title']=event.title
+		else:
+			command['channelId']=self._message.get('channel')
+			command['start']=self._message.get('start')
+			command['stop']=self._message.get('stop')
+
+		return command
 
 class HTSPAutoRecordEntry(HTSPResponse):
 	"""Represents an HTSP 'autorecEntryAdd ' reply message"""
@@ -348,6 +440,12 @@ class HTSPAutoRecordEntry(HTSPResponse):
 	# minDuration        u32   required   Minimal duration in seconds (0 = Any).
 	# maxDuration        u32   required   Maximal duration in seconds (0 = Any).
 	# retention          u32   required   Retention time (in days).
+
+	@property
+	def retention(self):
+		"""Retention of this entry"""
+		return self._message['retention']
+
 	# daysOfWeek         u32   required   Bitmask - Days of week (0x01 = Monday, 0x40 = Sunday, 0x7f = Whole Week, 0 = Not set).
 	
 	# priority           u32   required   Priority (0 = Important, 1 = High, 2 = Normal, 3 = Low, 4 = Unimportant, 5 = Not set).
@@ -371,7 +469,7 @@ class HTSPAutoRecordEntry(HTSPResponse):
 	@property
 	def channel(self):
 		if 'channel' in self._message:
-			return self._session.get_channel(self._message['channel'])
+			return self._session._get_channel(self._message['channel'])
 		return None
 
 class HTSPEvent(HTSPResponse):
@@ -388,8 +486,8 @@ class HTSPEvent(HTSPResponse):
 
 	# channelId          u32   required   The channel this event is related to.
 	@property
-	def channel_id(self):
-		return self._message['channelId']
+	def channel(self):
+		return self._session._get_channel(self._message['channelId'])
 
 	# start              u64   required   Start time of event, UNIX time.
 	@property
@@ -419,9 +517,31 @@ class HTSPEvent(HTSPResponse):
 		return self._message['description'].decode('utf8')
 
 	# serieslinkId       u32   optional   Series Link ID (Added in version 6).
+	@property
+	def series_link_id(self):
+		self._checkProtocol(6)
+		return self._message.get('serieslinkId',None)
+
 	# episodeId          u32   optional   Episode ID (Added in version 6).
+	@property
+	def episode_id(self):
+		self._checkProtocol(6)
+		return self._message.get('episodeId',None)
+
 	# seasonId           u32   optional   Season ID (Added in version 6).
+	@property
+	def season_id(self):
+		self._checkProtocol(6)
+		return self._message.get('seasonId',None)
+
 	# brandId            u32   optional   Brand ID (Added in version 6).
+	@property
+	def brand_id(self):
+		self._checkProtocol(6)
+		return self._message.get('brandId',None)
+
+
+
 	# contentType        u32   optional   DVB content code (Added in version 4, Modified in version 6*).
 	# ageRating          u32   optional   Minimum age rating (Added in version 6).
 	# starRating         u32   optional   Star rating (1-5) (Added in version 6).
@@ -464,8 +584,7 @@ class HTSPSession:
 		self._initial_data=False
 		self._tags={}
 		self._channels={}
-		self._recorded={}
-		self._scheduled={}
+		self._dvr_entries={}
 		self._auto_record_entries={}
 
 	def hello (self):
@@ -564,7 +683,7 @@ class HTSPSession:
 		if not self._initial_data:
 			self.fetch_initial_data()
 
-		return self._recorded.values()
+		return filter(lambda entry:entry.state=='completed',self._dvr_entries.values())
 
 	@property
 	def scheduled(self):
@@ -573,7 +692,7 @@ class HTSPSession:
 		if not self._initial_data:
 			self.fetch_initial_data()
 
-		return self._scheduled.values()
+		return filter(lambda entry:entry.state=='scheduled' or entry.state=='recording',self._dvr_entries.values())
 
 
 
@@ -586,8 +705,17 @@ class HTSPSession:
 
 		return self._auto_record_entries.values()
 
+	def create_dvr_entry(self):
+		"""Create a new HTSPDVREntry instance"""
+		return HTSPDVREntry(self,None)
 
-	def get_channel(self,channel_id):
+	def add_dvr_entry(self,entry):
+		"""Create a new DVR entry, wraps HTSP addDvrEntry"""
+		message=self._invoke_command('addDvrEntry',entry._as_add_dvr_entry_command())
+		HTSPSession._check_response(message)
+		return self._dvr_entries[message["id"]]
+
+	def _get_channel(self,channel_id):
 		"""Get the channel with the given id, as an HTSPChannel instance"""
 
 		if channel_id in self._channels.keys():
@@ -602,7 +730,8 @@ class HTSPSession:
 
 			return self._handle_channelAdd(message)
 
-	def get_events(self,channel_id):
+	def _get_events(self,channel_id):
+		"""Get the list of events on the channel identified by channel_id"""
 
 		self._checkProtocol(4)
 
@@ -613,6 +742,14 @@ class HTSPSession:
 		events=map(lambda message:self._handle_eventAdd(message),messages['events'])
 
 		return events
+
+	def _get_event(self,event_id):
+		"""Get the event with the given id, as an HTSPEvent instance"""
+		message=self._invoke_command('getEvent',{
+			'eventId':event_id
+			})
+		return self._handle_eventAdd(message)
+
 
 	def _check_connection(self):
 		if not self._sock:
@@ -677,7 +814,6 @@ class HTSPSession:
 		new=HTSPTag(self,message)
 		old=self._tags[new.id]
 		HTSPSession._update_reponse(old,new)
-		pass
 
 	def _handle_channelAdd(self,message):
 		channel=HTSPChannel(self,message)
@@ -689,17 +825,21 @@ class HTSPSession:
 		return event
 
 	def _handle_dvrEntryAdd(self,message):
-
 		entry=HTSPDVREntry(self,message)
-		if entry.state=="completed":
-			self._recorded[entry.id]=entry
-		elif entry.state=="scheduled" or entry.state=="recording":
-			self._scheduled[entry.id]=entry
-		else:
-			#"missed";
-			#"invalid";
-			pass
+		#print "_handle_dvrEntryAdd: id=%s"%(entry.id)
+		self._dvr_entries[entry.id]=entry
 		return entry
+
+	def _handle_dvrEntryDelete(self,message):
+		entry=HTSPDVREntry(self,message)
+		if entry.id in self._dvr_entries:
+			self._dvr_entries.pop(entry.id,None)
+
+	def _handle_dvrEntryUpdate(self,message):
+
+		new=HTSPDVREntry(self,message)
+		old=self._dvr_entries[new.id]
+		HTSPSession._update_reponse(old,new)
 
 	def  _handle_autorecEntryAdd(self,message):
 		entry=HTSPAutoRecordEntry(self,message)
@@ -728,6 +868,10 @@ class HTSPSession:
 				#print "update key=%s old value=%s new value=%s"%(key,old._message[key] if key in old._message else "N/A",new._message[key])
 				old._message[key]=new._message[key]
 
+	@staticmethod
+	def _check_response(message):
+		if not message['success']:
+			raise RequestError(message['error'])
 
 	def _notify(self,message):
 		pass

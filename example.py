@@ -17,6 +17,8 @@
 # WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE 
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import datetime
+import time
 
 from python_htsp import htsp_session
 
@@ -35,8 +37,8 @@ print "Used : %d"%(diskspace.used_disk_space)
 print "Free : %d"%(diskspace.free_disk_space)
 print "Total: %d"%(diskspace.total_disk_space)
 
-time=session.system_time
-print "System Time : %s"%(time.datetime)
+system_time=session.system_time
+print "System Time : %s"%(system_time.datetime)
 
 print
 print "Tags"
@@ -59,18 +61,19 @@ print "Recordings"
 print "----------"
 
 for entry in sorted(session.recorded,key=lambda entry:entry.start):
- 	print "%s %-16s %s on %s (%s)"%(entry.start,entry.state,entry.title,entry.channel.name,entry.duration)
+ 	print "%s %-16s %s on %s (%s); retention %s"%(entry.start,entry.state,entry.title,entry.channel.name,entry.duration,entry.retention)
 
 print
 print "Scheduled"
 print "---------"
 
 for entry in sorted(session.scheduled,key=lambda entry:entry.start):
- 	print "%s %-16s %s on %s (%s)"%(entry.start,entry.state,entry.title,entry.channel.name,entry.duration)
+ 	print "%s %-16s %s on %s (%s); retention %s; event %s"%(entry.start,entry.state,entry.title,entry.channel.name,entry.duration,entry.retention,entry.event.title if entry.event else None)
 
 print
 print "Auto Recordings"
 print "---------------"
 
 for entry in session.auto_record_entries:
- 	print "%s on %s priority %d"%(entry.title,entry.channel.name if entry.channel else "N/A",entry.priority)
+ 	print "%s on %s priority %d retention %d"%(entry.title,entry.channel.name if entry.channel else "N/A",entry.priority,entry.retention)
+
