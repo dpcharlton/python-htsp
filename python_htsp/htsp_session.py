@@ -210,9 +210,23 @@ class HTSPChannel(HTSPResponse):
 	#                                     (For v8+ clients this could be a relative /imagecache/ID URL
 	#                                      intended to be fed to fileOpen() or HTTP server)
 	#                                     (For v15+ clients this could be a relative imagecache/ID URL
+
 	#                                      intended to be fed to fileOpen() or HTTP server)
 	# eventId            u32   optional   ID of the current event on this channel.
+	@property
+	def now(self):
+		"""Current event on this channel"""
+		if 'eventId' in self._message:
+			return self._session._get_event(self._message['eventId'])
+
+
+
 	# nextEventId        u32   optional   ID of the next event on the channel.
+	@property
+	def next(self):
+		"""Next event on the channel"""
+		if 'nextEventId' in self._message:
+			return self._session._get_event(self._message['nextEventId'])
 	
 	# tags               u32[] optional   Tags this channel is mapped to.
 	@property
@@ -236,6 +250,9 @@ class HTSPChannel(HTSPResponse):
 	@property
 	def events(self):
 		return self._session._get_events(self.id)
+
+	def __str__(self):
+		return "HTSPChannel: {0} {1}; now={2}; next={3}".format(self.number,self.name,self.now,self.next)
 
 
 class HTSPTag(HTSPResponse):
@@ -312,9 +329,20 @@ class HTSPDVREntry(HTSPResponse):
 
 
 	# startExtra         s64   required   Extra start time (pre-time) in minutes (Added in version 13).
-	# stopExtra          s64   required   Extra stop time (post-time) in minutes (Added in version 13).
-	# retention          s64   required   DVR Entry retention time in days.
+	@property
+	def start_extra(self):
+		"""Extra start time (pre-time) in minutes"""
+		self._checkProtocol(13)
+		return self._message['startExtra']
 
+	# stopExtra          s64   required   Extra stop time (post-time) in minutes (Added in version 13).
+	@property
+	def stop_extra(self):
+		"""Extra stop time (post-time) in minutes"""
+		self._checkProtocol(13)
+		return self._message['stopExtra']
+
+	# retention          s64   required   DVR Entry retention time in days.
 	@property
 	def retention(self):
 		"""Retention of this entry"""
@@ -354,23 +382,29 @@ class HTSPDVREntry(HTSPResponse):
 	# summary            str   optional   Short description of the recording (Added in version 6).
 	@property
 	def summary(self):
+		"""Short description of the recording"""
 		self._checkProtocol(6)
 		return self._message.get('summary',None)
 
 	# description        str   optional   Long description of the recording.
 	@property
 	def description(self):
+		"""Long description of the recording"""
 		return self._message.get('description',None)
 
 
 	# state              str   required   Recording state
 	@property
 	def state(self):
+		""" Recording state"""
 		return self._message.get('state',None)
 
 
 
 	# error              str   optional   Plain english error description (e.g. "Aborted by user").
+
+	def __str__(self):
+		return "HTSPDVREntry: {0} {1}".format(self.title,self.state)
 
 	def _as_add_dvr_entry_command(self):
 		"""Map this HTSPDVREntry into a HTSP addDvrEntry request message """
@@ -428,6 +462,7 @@ class HTSPAutoRecordEntry(HTSPResponse):
 	# id                 str   required   ID (string!) of dvrAutorecEntry.
 	@property
 	def id(self):
+		"""ID of this entry"""
 		return self._message['id']
 
 
@@ -472,6 +507,10 @@ class HTSPAutoRecordEntry(HTSPResponse):
 			return self._session._get_channel(self._message['channel'])
 		return None
 
+	def __str__(self):
+		return "HTSPAutoRecordEntry: {0} ".format(self.title)
+
+
 class HTSPEvent(HTSPResponse):
 	"""Represents an HTSP 'eventAdd' reply message"""
 
@@ -497,8 +536,13 @@ class HTSPEvent(HTSPResponse):
 	# stop               u64   required   Ending time of event, UNIX time.
 	@property
 	def stop(self):
-		
 		return self._datetime_from_timestamp(self._message['stop'])
+
+	@property
+	def duration(self):
+		"""Duration of this event"""
+		return self.stop-self.start
+
 
 	# title              str   optional   Title of event.
 	@property
@@ -563,13 +607,19 @@ class HTSPEvent(HTSPResponse):
 
 	# nextEventId        u32   optional   ID of next event on the same channel.
 
+	def __str__(self):
+		return "HTSPEvent: {0} {1}-{2} ({3})".format(self.title,self.start,self.stop.time(),self.duration)
+
 
 class HTSPSession:
 		
- 	def __init__ (self, host='localhost',port=9982, name = 'python-htsp' ):
-		self._addr=(host,port)
+ 	def __init__ (self, host='localhost',port=9982, addr=None,name = 'python-htsp' ):
+ 		if addr:
+ 			self._addr=addr
+ 		else:
+			self._addr=(host,port)
+			
 		self._name = name
-
 		self._sock = None
 
 		self._auth = None
@@ -584,8 +634,11 @@ class HTSPSession:
 		self._initial_data=False
 		self._tags={}
 		self._channels={}
+		self._events={}
 		self._dvr_entries={}
 		self._auto_record_entries={}
+
+		self._callbacks=[]
 
 	def hello (self):
 		"""Issue an htsp 'hello' command to the server and return an HTSPHello response instance"""
@@ -715,6 +768,25 @@ class HTSPSession:
 		HTSPSession._check_response(message)
 		return self._dvr_entries[message["id"]]
 
+	def monitor(self,callback):
+
+		if not self._initial_data:
+			self.fetch_initial_data()
+
+		self._callbacks.append(callback)
+
+		try:
+			while True:
+				message=self._recv()
+				n=self._handleMessage(message)
+				self._notify(message,n)
+		except KeyboardInterrupt: 
+			self._callbacks.remove(callback)
+		except Exception as e:
+			print e
+			pass
+
+
 	def _get_channel(self,channel_id):
 		"""Get the channel with the given id, as an HTSPChannel instance"""
 
@@ -763,7 +835,7 @@ class HTSPSession:
 	def _invoke_command(self,method,args={}):
 
 		if self._command_pending:
-			raise Exception("A command is already pending")
+			raise Exception("A command is already pending: {0}".format(method))
 
 		self._command_pending=True
 
@@ -772,9 +844,9 @@ class HTSPSession:
 
 		message=self._recv()
 
+		notify_queue=[]
 		while not 'seq' in message:
-			self._handleMessage(message)
-			#self._notify(message)
+			notify_queue.append(message)
 			message=self._recv()
 
 		if message['seq'] != self._sequence:
@@ -783,6 +855,11 @@ class HTSPSession:
 		self._sequence+=1
 
 		self._command_pending=False
+
+		for queued_message in notify_queue:
+			n=self._handleMessage(queued_message)
+			self._notify(queued_message,n)
+
 
 		return message
 
@@ -814,11 +891,19 @@ class HTSPSession:
 		new=HTSPTag(self,message)
 		old=self._tags[new.id]
 		HTSPSession._update_reponse(old,new)
+		return old
 
 	def _handle_channelAdd(self,message):
 		channel=HTSPChannel(self,message)
 		self._channels[channel.id]=channel
 		return channel
+
+	def _handle_channelUpdate(self,message):
+		new =HTSPChannel(self,message)
+		old=self._channels[new.id]
+		HTSPSession._update_reponse(old,new)
+		return old
+
 
 	def _handle_eventAdd(self,message):
 		event=HTSPEvent(self,message)
@@ -833,19 +918,25 @@ class HTSPSession:
 	def _handle_dvrEntryDelete(self,message):
 		entry=HTSPDVREntry(self,message)
 		if entry.id in self._dvr_entries:
-			self._dvr_entries.pop(entry.id,None)
+			return self._dvr_entries.pop(entry.id,None)
 
 	def _handle_dvrEntryUpdate(self,message):
 
 		new=HTSPDVREntry(self,message)
 		old=self._dvr_entries[new.id]
 		HTSPSession._update_reponse(old,new)
+		return old
 
 	def  _handle_autorecEntryAdd(self,message):
 		entry=HTSPAutoRecordEntry(self,message)
 		self._auto_record_entries[entry.id]=entry
 		return entry
 
+	def _handle_autorecEntryUpdate(self,message):
+		new=HTSPAutoRecordEntry(self,message)
+		old=self._auto_record_entries[new.id]
+		HTSPSession._update_reponse(old,new)
+		return old
 
 	def _handleMessage(self,message):
 		if 'method' in message:
@@ -873,8 +964,11 @@ class HTSPSession:
 		if not message['success']:
 			raise RequestError(message['error'])
 
-	def _notify(self,message):
-		pass
-		#print "notify: "+str(message)
+	def _notify(self,message,notification):
+		method=message['method']
+
+		for callback in self._callbacks:
+			callback(method,notification)
+		
 
 

@@ -77,3 +77,8 @@ print "---------------"
 for entry in session.auto_record_entries:
  	print "%s on %s priority %d retention %d"%(entry.title,entry.channel.name if entry.channel else "N/A",entry.priority,entry.retention)
 
+def handle_event(method,notification):
+	print "Notified: %s; %s"%(method,notification)
+
+print "Monitoring (^C to stop) ..."
+session.monitor(handle_event)
