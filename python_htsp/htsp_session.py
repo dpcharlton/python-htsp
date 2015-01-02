@@ -21,12 +21,21 @@
 
 import datetime
 import hashlib
+import logging
 import socket
 import time
 
 from tvh import htsmsg
 
 HTSP_PROTO_VERSION = 17
+
+class NullHandler(logging.Handler):
+    def emit(self, record):
+        pass
+
+_logger = logging.getLogger(__name__)
+_logger.addHandler(NullHandler())
+
 
 class ProtocolVersionException(Exception):
 	"""Raised when an operation is requested that is not supported by the protocol version"""
@@ -162,16 +171,54 @@ class HTSPSystemTime(HTSPResponse):
 class HTSPService(HTSPResponse):
 	"""Represents an HTSP service"""
 
+	# Note: HTSP gives limited information about services, the code
+	# here attempts to infer additional information, but this is
+	# based on incomplete and quite possibly incorrect knowledge
+	# of tvheadend internals
+
 	def __init__(self,session,message):
 		super(HTSPService, self).__init__(session,message)
 
 	@property
 	def type(self):
+		"""Get the type of the service (.g. SDTV)"""
 		return self._message['type']
 
 	@property
 	def name(self):
+		"""Get the full name of the service (e.g. Gloucestershire/530/BBC TWO)"""
 		return self._message['name']
+
+	@property
+	def network(self):
+		"""Get the network name of the service (e.g. Gloucestershire)"""
+		# based on possibly dodgy assumptions
+		try:
+			parts=self._message['name'].split("/")		
+			return parts[0]
+		except:
+			return None
+
+	@property
+	def mux(self):
+		"""Get the multiplex name of the service (e.g. 530)"""
+		# based on possibly dodgy assumptions
+		try:
+			parts=self._message['name'].split("/")		
+			return parts[1]
+		except:
+			return None
+
+	@property
+	def resource(self):
+		"""Get the resouce name of the service (e.g. Gloucestershire/530/)"""
+		# based on possibly dodgy assumptions
+		try:
+			parts=self._message['name'].split("/")		
+			return "/".join(parts[:2])
+		except:
+			return None
+
 
 
 class HTSPChannel(HTSPResponse):
@@ -276,7 +323,13 @@ class HTSPTag(HTSPResponse):
 
 	# tagIcon            str   optional   URL to an icon representative for the channel.
 	# tagTitledIcon      u32   optional   Icon includes a title
+	
 	# members            u32[] optional   Channel IDs of those that belong to the tag
+	@property
+	def channels(self):
+		"""Channel that belong to the tag"""
+		if 'members' in self._message:
+			return map(lambda channel_id:self._session._get_channel(channel_id),self._message['members'])
 
 class HTSPDVREntry(HTSPResponse):
 	"""Represents an HTSP 'dvrEntryAdd' reply message"""
@@ -405,6 +458,12 @@ class HTSPDVREntry(HTSPResponse):
 
 	def __str__(self):
 		return "HTSPDVREntry: {0} {1}".format(self.title,self.state)
+
+	def _as_cancel_dvr_entry_command(self):
+		command={
+			'id':self._message['id']
+		}		
+		return command
 
 	def _as_add_dvr_entry_command(self):
 		"""Map this HTSPDVREntry into a HTSP addDvrEntry request message """
@@ -558,7 +617,7 @@ class HTSPEvent(HTSPResponse):
 	# description        str   optional   Long description of the event.
 	@property
 	def description(self):
-		return self._message['description'].decode('utf8')
+		return self._message.get('description',None)
 
 	# serieslinkId       u32   optional   Series Link ID (Added in version 6).
 	@property
@@ -607,8 +666,20 @@ class HTSPEvent(HTSPResponse):
 
 	# nextEventId        u32   optional   ID of next event on the same channel.
 
+	# not documented
+	# episodeUri
+	@property
+	def episode_uri(self):
+		return self._message.get('episodeUri',None)
+
+	# serieslinkUri
+	@property
+	def series_link_uri(self):
+		return self._message.get('serieslinkUri',None)
+
 	def __str__(self):
 		return "HTSPEvent: {0} {1}-{2} ({3})".format(self.title,self.start,self.stop.time(),self.duration)
+
 
 
 class HTSPSession:
@@ -634,7 +705,7 @@ class HTSPSession:
 		self._initial_data=False
 		self._tags={}
 		self._channels={}
-		self._events={}
+		self._events=None
 		self._dvr_entries={}
 		self._auto_record_entries={}
 
@@ -667,12 +738,13 @@ class HTSPSession:
 			raise Exception('Authentication failed')
 
 
-	def fetch_initial_data(self):
+	def fetch_initial_data(self,events=False):
 		"""Issue an htsp 'enableAsyncMetadata' command to the server and collect the initial data"""
 		
-		self._check_connection()		
 
-		self._enable_async_metadata()
+		self._events={} if events else None
+		self._check_connection()		
+		self._enable_async_metadata(events)
 		while not self._initial_data:
 			message = self._recv()
 			self._handleMessage(message)
@@ -768,6 +840,14 @@ class HTSPSession:
 		HTSPSession._check_response(message)
 		return self._dvr_entries[message["id"]]
 
+	def cancel_dvr_entry(self,entry):
+		"""Cancels a DVR entry, wraps HTSP cancelDvrEntry"""
+		message=self._invoke_command('cancelDvrEntry',entry._as_cancel_dvr_entry_command())
+		HTSPSession._check_response(message)
+		return entry
+
+
+
 	def monitor(self,callback):
 
 		if not self._initial_data:
@@ -807,20 +887,30 @@ class HTSPSession:
 
 		self._checkProtocol(4)
 
-		messages=self._invoke_command('getEvents',{
-			'channelId':channel_id
-			})
+		if self._events!=None:
+			events=filter(lambda event:event.channel.id==channel_id,self._events)
+		else:
+			messages=self._invoke_command('getEvents',{
+				'channelId':channel_id
+				})
 
-		events=map(lambda message:self._handle_eventAdd(message),messages['events'])
+			events=map(lambda message:self._handle_eventAdd(message),messages['events'])
 
 		return events
 
 	def _get_event(self,event_id):
 		"""Get the event with the given id, as an HTSPEvent instance"""
-		message=self._invoke_command('getEvent',{
-			'eventId':event_id
-			})
-		return self._handle_eventAdd(message)
+
+		if self._events!=None:
+			event=self._events[event_id]
+		else:
+			message=self._invoke_command('getEvent',{
+				'eventId':event_id
+				})
+
+			event=self._handle_eventAdd(message)
+
+		return event
 
 
 	def _check_connection(self):
@@ -828,11 +918,16 @@ class HTSPSession:
 			self.hello()
 
 
-	def _enable_async_metadata(self):
-		self._invoke_command('enableAsyncMetadata')
+	def _enable_async_metadata(self,events):
+		_logger.info('Fetching initial data')
+		self._invoke_command('enableAsyncMetadata',{
+			'epg':1 if events else 0
+			})
 
 
 	def _invoke_command(self,method,args={}):
+
+		_logger.debug('> {0}:{1}'.format(method,args))
 
 		if self._command_pending:
 			raise Exception("A command is already pending: {0}".format(method))
@@ -843,6 +938,7 @@ class HTSPSession:
 		self._send(method,args)
 
 		message=self._recv()
+		_logger.debug('< {0}'.format(message))
 
 		notify_queue=[]
 		while not 'seq' in message:
@@ -907,7 +1003,19 @@ class HTSPSession:
 
 	def _handle_eventAdd(self,message):
 		event=HTSPEvent(self,message)
+		if self._events!=None:
+			self._events[event.id]=event
 		return event
+
+	def _handle_eventDelete(self,message):
+		if self._events!=None:
+			event=HTSPEvent(self,message)
+			if event.id in self._events:
+				return self._events.pop(event.id,None)
+			else:
+				_logger.warning("eventDelete rxed for an unknown event")	
+		else:
+			_logger.warning("eventDelete rxed but no event map")
 
 	def _handle_dvrEntryAdd(self,message):
 		entry=HTSPDVREntry(self,message)
