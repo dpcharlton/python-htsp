@@ -820,6 +820,15 @@ class HTSPSession:
 		return filter(lambda entry:entry.state=='scheduled' or entry.state=='recording',self._dvr_entries.values())
 
 
+	@property
+	def failed(self):
+		"""The set of failed items on the server, as an array of HTSPDVREntry instances"""
+		
+		if not self._initial_data:
+			self.fetch_initial_data()
+
+		return filter(lambda entry:entry.state=='missed',self._dvr_entries.values())
+
 
 	@property
 	def auto_record_entries(self):
